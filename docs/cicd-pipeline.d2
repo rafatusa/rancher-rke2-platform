@@ -1,0 +1,84 @@
+# CI/CD pipeline for rancher-rke2-platform
+# Render with: d2 docs/cicd-pipeline.d2 docs/cicd-pipeline.svg
+
+direction: right
+
+deploy: "deploy.yml (workflow_dispatch)" {
+  lint: "lint\ngradle compileJava" {
+    shape: rectangle
+  }
+  test: "test\nunit tests + JaCoCo\ncoverage gate 70% / 50%" {
+    shape: rectangle
+  }
+  build: "build\ngradle bootJar" {
+    shape: rectangle
+  }
+  image: "image\ndocker buildx\npush to GHCR (sha tag)" {
+    shape: rectangle
+  }
+  provision: "provision\nterraform apply\nVPC + 4 EC2 + EIP + IAM" {
+    shape: rectangle
+    style.fill: "#1f3a5f"
+  }
+  configure: "configure\nansible-playbook site.yml\nRKE2 + Helm + cert-manager\n+ ingress-nginx + Rancher" {
+    shape: rectangle
+    style.fill: "#1f3a5f"
+  }
+  release: "release\nscp chart to master\nhelm upgrade --install --wait\nrollout status" {
+    shape: rectangle
+    style.fill: "#1f3a5f"
+  }
+  verify: "verify\ncluster-health.sh\nAPI /health + Rancher /healthz" {
+    shape: rectangle
+    style.fill: "#14532d"
+  }
+
+  lint -> test -> build -> image -> provision -> configure -> release -> verify
+}
+
+validation: "validation.yml (workflow_dispatch)" {
+  k8s_health: "k8s_health\nnodes Ready\npods Running\nhelm releases deployed" {
+    shape: rectangle
+  }
+  smoke: "smoke\nsmoke-test.sh\nREST Assured integrationTest" {
+    shape: rectangle
+  }
+  load: "load\nk6 ramping VUs\np95 < 800ms, errors < 1%" {
+    shape: rectangle
+  }
+
+  k8s_health -> smoke -> load
+}
+
+destroy: "destroy.yml (workflow_dispatch)" {
+  teardown: "terraform destroy\nsame backend key" {
+    shape: rectangle
+    style.fill: "#5f1f1f"
+  }
+}
+
+state: "S3 terraform state\nTF_STATE_BUCKET/PROJECT_NAME/terraform.tfstate" {
+  shape: cylinder
+}
+
+ghcr: "GitHub Container Registry\nghcr.io/<owner>/employee-api" {
+  shape: cylinder
+}
+
+cluster: "RKE2 cluster on AWS\n1 server + 3 agents" {
+  shape: hexagon
+}
+
+deploy.image -> ghcr: push
+deploy.provision <-> state: read/write
+deploy.configure -> cluster: SSH + ansible
+deploy.release -> cluster: helm via SSH
+cluster -> ghcr: pull image
+deploy.verify -> cluster: health checks
+
+validation.k8s_health -> cluster: kubectl/helm via SSH
+validation.smoke -> cluster: HTTP through ingress
+validation.load -> cluster: k6 traffic
+
+destroy.teardown <-> state: read/delete
+destroy.teardown -> cluster: terraform destroy

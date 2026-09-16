@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Managed by Ansible - do not edit by hand.
+#
+# Cluster health verification, run on the RKE2 server node.
+# Exits non-zero (and prints the offending objects) if any check fails.
+set -euo pipefail
+
+export KUBECONFIG="{{ kubeconfig_path }}"
+export PATH="$PATH:/var/lib/rancher/rke2/bin"
+
+KUBECTL="{{ kubectl_bin }}"
+HELM="{{ helm_bin }}"
+EXPECTED_NODES={{ groups['rke2_cluster'] | length }}
+
+fail() {
+  echo "FAIL: $*" >&2
+  exit 1
+}
+
+echo "=== Nodes ==="
+"$KUBECTL" get nodes -o wide
+
+total_nodes=$("$KUBECTL" get nodes --no-headers | wc -l | tr -d ' ')
+ready_nodes=$("$KUBECTL" get nodes --no-headers | awk '$2 == "Ready" {count++} END {print count+0}')
+
+echo "nodes: ${ready_nodes} Ready of ${total_nodes} registered (expected ${EXPECTED_NODES})"
+[ "$total_nodes" -ge "$EXPECTED_NODES" ] || fail "only ${total_nodes} of ${EXPECTED_NODES} nodes registered"
+[ "$ready_nodes" -eq "$total_nodes" ] || fail "not every node is Ready"
+
+echo
+echo "=== Pods not Running/Succeeded ==="
+# Exclude Completed jobs and evicted leftovers; anything else pending is a failure.
+bad_pods=$("$KUBECTL" get pods --all-namespaces --no-headers \
+  --field-selector=status.phase!=Running,status.phase!=Succeeded | wc -l | tr -d ' ')
+if [ "$bad_pods" -ne 0 ]; then
+  "$KUBECTL" get pods --all-namespaces \
+    --field-selector=status.phase!=Running,status.phase!=Succeeded
+  fail "${bad_pods} pod(s) are not Running or Succeeded"
+fi
+echo "all pods Running or Succeeded"
+
+echo
+echo "=== Helm releases ==="
+"$HELM" list --all-namespaces
+
+for release in "cert-manager:{{ cert_manager_namespace }}" \
+               "ingress-nginx:{{ ingress_namespace }}" \
+               "rancher:{{ rancher_namespace }}"; do
+  name="${release%%:*}"
+  ns="${release##*:}"
+  status=$("$HELM" status "$name" -n "$ns" -o json 2>/dev/null | jq -r '.info.status' || echo "missing")
+  echo "helm release ${name} in ${ns}: ${status}"
+  [ "$status" = "deployed" ] || fail "helm release ${name} is '${status}', expected 'deployed'"
+done
+
+# The application release only exists after the first app deployment; treat a
+# missing release as a soft skip so this script is usable right after bootstrap.
+app_status=$("$HELM" status employee-api -n "{{ app_namespace }}" -o json 2>/dev/null | jq -r '.info.status' || echo "missing")
+echo "helm release employee-api in {{ app_namespace }}: ${app_status}"
+if [ "$app_status" != "missing" ] && [ "$app_status" != "deployed" ]; then
+  fail "helm release employee-api is '${app_status}', expected 'deployed'"
+fi
+
+echo
+echo "=== Rancher deployment ==="
+"$KUBECTL" -n "{{ rancher_namespace }}" rollout status deploy/rancher --timeout=300s
+"$KUBECTL" -n "{{ rancher_namespace }}" get pods -o wide
+
+echo
+echo "=== Ingress controller ==="
+"$KUBECTL" -n "{{ ingress_namespace }}" rollout status ds/ingress-nginx-controller --timeout=300s
+
+echo
+echo "=== cert-manager ==="
+"$KUBECTL" -n "{{ cert_manager_namespace }}" rollout status deploy/cert-manager --timeout=300s
+"$KUBECTL" -n "{{ cert_manager_namespace }}" rollout status deploy/cert-manager-webhook --timeout=300s
+
+echo
+echo "=== Ingress objects ==="
+"$KUBECTL" get ingress --all-namespaces
+
+echo
+echo "ALL CLUSTER HEALTH CHECKS PASSED"

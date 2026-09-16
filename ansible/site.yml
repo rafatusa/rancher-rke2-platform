@@ -1,0 +1,39 @@
+---
+# Rancher / RKE2 platform configuration.
+#
+# Ordering matters and is enforced by play sequence:
+#   1. common      - OS prerequisites on every node (containerd deps, sysctl, tools)
+#   2. rke2_server - control plane on the master, then kubectl/helm tooling
+#   3. rke2_agent  - workers join the cluster
+#   4. platform    - cert-manager, ingress-nginx, Rancher (needs workers Ready)
+#
+# Every play is idempotent: re-running site.yml on a converged cluster makes no
+# changes and is the supported recovery action.
+
+- name: Common OS preparation on all cluster nodes
+  hosts: rke2_cluster
+  become: true
+  gather_facts: true
+  roles:
+    - role: common
+
+- name: Configure RKE2 server (control plane)
+  hosts: rke2_server
+  become: true
+  gather_facts: true
+  roles:
+    - role: rke2_server
+
+- name: Configure RKE2 agents (workers)
+  hosts: rke2_agents
+  become: true
+  gather_facts: true
+  roles:
+    - role: rke2_agent
+
+- name: Install platform components (cert-manager, ingress-nginx, Rancher)
+  hosts: rke2_server
+  become: true
+  gather_facts: true
+  roles:
+    - role: platform

@@ -1,0 +1,43 @@
+# udap:meta cloud=aws region=us-east-1 target=ec2
+
+direction: right
+user: Platform Operator { shape: person; udap-type: generic.user }
+ghcr: GitHub Container Registry { icon: simple:github; udap-type: generic.app }
+actions: GitHub Actions CI/CD { icon: simple:githubactions; udap-type: generic.app }
+vpc: Platform VPC 10.20.0.0/16 {
+  igw: Internet Gateway { udap-type: aws.internetgateway }
+  master: RKE2 Server + Rancher (t3.large) { udap-type: aws.ec2 }
+  worker1: RKE2 Agent 1 (t3.medium) { udap-type: aws.ec2 }
+  worker2: RKE2 Agent 2 (t3.medium) { udap-type: aws.ec2 }
+  worker3: RKE2 Agent 3 (t3.medium) { udap-type: aws.ec2 }
+  eip: Elastic IP (Master) { udap-type: aws.eip }
+  sg: Security Groups { udap-type: aws.securitygroup }
+}
+ingress: NGINX Ingress Controller { icon: simple:nginx; udap-type: generic.app }
+certmgr: cert-manager TLS { icon: simple:letsencrypt; udap-type: generic.app }
+rancher: Rancher Management UI { icon: simple:rancher; udap-type: generic.app }
+app: Employee API (Spring Boot) { icon: simple:springboot; udap-type: generic.app }
+cw: CloudWatch Agent Metrics + Logs { udap-type: aws.cloudwatch }
+tfstate: Terraform State S3 { udap-type: aws.s3 }
+
+user -> vpc.eip: HTTPS 443 Rancher UI + API
+vpc.igw -> vpc.eip: public ingress
+vpc.eip -> vpc.master: associated
+vpc.master -> ingress: hosts ingress controller
+ingress -> rancher: routes rancher.<ip>.sslip.io
+ingress -> app: routes employee api
+certmgr -> ingress: issues TLS certificates
+rancher -> vpc.worker1: manages node
+rancher -> vpc.worker2: manages node
+rancher -> vpc.worker3: manages node
+vpc.worker1 -> vpc.master: RKE2 join 9345
+vpc.worker2 -> vpc.master: RKE2 join 9345
+vpc.worker3 -> vpc.master: RKE2 join 9345
+app -> vpc.worker1: scheduled pods
+actions -> vpc.master: SSH helm upgrade + kubectl
+actions -> ghcr: push image sha tag
+vpc.worker1 -> ghcr: pull employee-api image
+vpc.master -> cw: metrics and logs
+vpc.worker1 -> cw: metrics and logs
+actions -> tfstate: terraform state
+actions -> vpc.igw: terraform provision

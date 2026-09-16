@@ -1,0 +1,30 @@
+# Managed by Ansible - do not edit by hand.
+# RKE2 server configuration for the {{ inventory_hostname }} control-plane node.
+
+token: "{{ rke2_token }}"
+
+# node-name is pinned explicitly rather than inherited from the OS hostname, so
+# readiness checks know exactly which node object to wait for.
+node-name: "{{ inventory_hostname }}"
+node-ip: "{{ node_private_ip }}"
+advertise-address: "{{ node_private_ip }}"
+
+tls-san:
+  - "{{ master_public_ip }}"
+  - "{{ master_private_ip }}"
+  - "{{ rancher_hostname }}"
+  - "127.0.0.1"
+
+# ingress-nginx is installed and managed by Helm in the platform role so the
+# controller can run as a hostNetwork DaemonSet pinned to this node.
+disable:
+  - rke2-ingress-nginx
+
+write-kubeconfig-mode: "0600"
+
+# Automatic etcd snapshots: every 6 hours, 10 retained on local disk.
+etcd-snapshot-schedule-cron: "0 */6 * * *"
+etcd-snapshot-retention: 10
+
+node-label:
+  - "platform/managed-by=udap"

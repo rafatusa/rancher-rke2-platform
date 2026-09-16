@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Managed by Ansible - do not edit by hand.
+#
+# Deploy (or upgrade) the Employee API Helm release on this cluster.
+#
+# Usage:
+#   deploy-employee-api.sh <image-repo> <image-tag> <registry-user> <master-ip>
+#
+# The registry credential is read from STDIN rather than passed as an argument,
+# so it never appears in the process list or in shell history.
+#
+# The chart is expected to have been copied to /tmp/employee-api-chart by CI.
+set -euo pipefail
+
+export KUBECONFIG="{{ kubeconfig_path }}"
+export PATH="$PATH:/var/lib/rancher/rke2/bin"
+
+KUBECTL="{{ kubectl_bin }}"
+HELM="{{ helm_bin }}"
+NAMESPACE="{{ app_namespace }}"
+CHART_DIR="/tmp/employee-api-chart"
+PULL_SECRET_NAME="ghcr-pull-secret"
+
+IMAGE_REPO="${1:?image repository required}"
+IMAGE_TAG="${2:?image tag required}"
+REGISTRY_USER="${3:?registry user required}"
+MASTER_IP="${4:?master ip required}"
+
+# Read the registry credential from stdin.
+read -r REGISTRY_CREDENTIAL || true
+if [ -z "${REGISTRY_CREDENTIAL:-}" ]; then
+  echo "FAIL: registry credential must be supplied on stdin" >&2
+  exit 1
+fi
+
+[ -f "${CHART_DIR}/Chart.yaml" ] || {
+  echo "FAIL: chart not found at ${CHART_DIR}" >&2
+  exit 1
+}
+
+echo "Deploying ${IMAGE_REPO}:${IMAGE_TAG} into namespace ${NAMESPACE}"
+
+# Namespace (idempotent)
+"$KUBECTL" create namespace "$NAMESPACE" --dry-run=client -o yaml | "$KUBECTL" apply -f -
+
+# Registry pull secret, built as a dockerconfigjson manifest and applied from
+# stdin. Recreated on every deploy so a rotated credential takes effect.
+build_dockerconfig() {
+  local auth
+  auth=$(printf '%s:%s' "$REGISTRY_USER" "$REGISTRY_CREDENTIAL" | base64 -w0)
+  printf '{"auths":{"ghcr.io":{"username":"%s","auth":"%s"}}}' "$REGISTRY_USER" "$auth"
+}
+
+DOCKERCONFIG_B64=$(build_dockerconfig | base64 -w0)
+unset REGISTRY_CREDENTIAL
+
+"$KUBECTL" apply -f - <<MANIFEST
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${PULL_SECRET_NAME}
+  namespace: ${NAMESPACE}
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: ${DOCKERCONFIG_B64}
+MANIFEST
+
+unset DOCKERCONFIG_B64
+
+"$HELM" upgrade --install employee-api "$CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  --set-string image.repository="$IMAGE_REPO" \
+  --set-string image.tag="$IMAGE_TAG" \
+  --set-string ingress.host="api.${MASTER_IP}.sslip.io" \
+  --wait \
+  --timeout 10m
+
+echo "Waiting for rollout to complete..."
+"$KUBECTL" -n "$NAMESPACE" rollout status deploy/employee-api --timeout=600s
+
+echo
+"$KUBECTL" -n "$NAMESPACE" get pods -o wide
+"$KUBECTL" -n "$NAMESPACE" get ingress
+
+echo
+echo "Verifying the service responds inside the cluster..."
+for attempt in $(seq 1 20); do
+  if "$KUBECTL" -n "$NAMESPACE" run "curl-check-${RANDOM}" \
+      --rm -i --restart=Never --image=curlimages/curl:8.10.1 --quiet -- \
+      curl --fail --silent --max-time 10 \
+      "http://employee-api.${NAMESPACE}.svc.cluster.local/health"; then
+    echo
+    echo "Employee API deployment verified"
+    exit 0
+  fi
+  echo "health check attempt ${attempt}/20 failed, retrying in 15s"
+  sleep 15
+done
+
+echo "FAIL: Employee API did not become healthy in-cluster" >&2
+"$KUBECTL" -n "$NAMESPACE" describe deploy/employee-api >&2
+"$KUBECTL" -n "$NAMESPACE" logs -l app.kubernetes.io/name=employee-api --tail=100 >&2 || true
+exit 1

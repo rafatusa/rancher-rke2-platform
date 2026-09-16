@@ -1,0 +1,179 @@
+---
+# Platform components on top of a healthy RKE2 cluster:
+#   cert-manager -> ingress-nginx -> Rancher
+#
+# Helm is driven through the CLI rather than kubernetes.core so the managed
+# nodes need no extra Python libraries. `helm upgrade --install` is idempotent
+# by construction; changed_when compares Helm's own revision number before and
+# after, so a converged cluster reports "ok" rather than "changed".
+
+- name: Fail fast when the Rancher bootstrap password was not supplied
+  ansible.builtin.assert:
+    that:
+      - rancher_bootstrap_password | length >= 12
+    fail_msg: >-
+      rancher_bootstrap_password must be provided (repo secret
+      RANCHER_BOOTSTRAP_PASSWORD) and be at least 12 characters.
+    quiet: true
+
+- name: Wait for all expected nodes to be Ready
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    {{ kubectl_bin }} --kubeconfig {{ kubeconfig_path }}
+    get nodes --no-headers | awk '$2 == "Ready"' | wc -l
+  args:
+    executable: /bin/bash
+  register: ready_node_count
+  changed_when: false
+  retries: 30
+  delay: 20
+  until: ready_node_count.stdout | int >= (groups['rke2_cluster'] | length)
+
+- name: Report cluster size
+  ansible.builtin.debug:
+    msg: >-
+      {{ ready_node_count.stdout | int }} node(s) Ready of
+      {{ groups['rke2_cluster'] | length }} expected
+
+# --- Helm repositories -----------------------------------------------------
+
+- name: Add Helm repositories
+  ansible.builtin.command: >-
+    {{ helm_bin }} repo add {{ item.name }} {{ item.url }} --force-update
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  loop:
+    - { name: jetstack, url: "https://charts.jetstack.io" }
+    - { name: ingress-nginx, url: "https://kubernetes.github.io/ingress-nginx" }
+    - { name: rancher-stable, url: "https://releases.rancher.com/server-charts/stable" }
+  register: helm_repo_add
+  changed_when: "'has been added' in helm_repo_add.stdout"
+
+- name: Update Helm repository indexes
+  ansible.builtin.command: "{{ helm_bin }} repo update"
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  changed_when: false
+
+# --- values files ----------------------------------------------------------
+
+- name: Ensure the Helm values directory exists
+  ansible.builtin.file:
+    path: /etc/rancher/platform-values
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Render cert-manager values
+  ansible.builtin.template:
+    src: cert-manager-values.yaml.j2
+    dest: /etc/rancher/platform-values/cert-manager.yaml
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Render ingress-nginx values
+  ansible.builtin.template:
+    src: ingress-nginx-values.yaml.j2
+    dest: /etc/rancher/platform-values/ingress-nginx.yaml
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Render Rancher values
+  ansible.builtin.template:
+    src: rancher-values.yaml.j2
+    dest: /etc/rancher/platform-values/rancher.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+# --- cert-manager ----------------------------------------------------------
+
+- name: Install or upgrade cert-manager
+  ansible.builtin.include_tasks: helm_release.yml
+  vars:
+    release_name: cert-manager
+    release_namespace: "{{ cert_manager_namespace }}"
+    release_chart: jetstack/cert-manager
+    release_version: "{{ cert_manager_version }}"
+    release_values_file: /etc/rancher/platform-values/cert-manager.yaml
+    release_timeout: 10m
+
+- name: Wait for cert-manager components to be available
+  ansible.builtin.command: >-
+    {{ kubectl_bin }} --kubeconfig {{ kubeconfig_path }}
+    -n {{ cert_manager_namespace }} rollout status deploy/{{ item }} --timeout=600s
+  loop:
+    - cert-manager
+    - cert-manager-webhook
+    - cert-manager-cainjector
+  changed_when: false
+
+# --- ingress-nginx ---------------------------------------------------------
+# hostNetwork DaemonSet: ports 80/443 on the master's Elastic IP reach the
+# controller directly, so no cloud load balancer is required.
+
+- name: Install or upgrade ingress-nginx
+  ansible.builtin.include_tasks: helm_release.yml
+  vars:
+    release_name: ingress-nginx
+    release_namespace: "{{ ingress_namespace }}"
+    release_chart: ingress-nginx/ingress-nginx
+    release_version: "{{ ingress_nginx_chart_version }}"
+    release_values_file: /etc/rancher/platform-values/ingress-nginx.yaml
+    release_timeout: 10m
+
+- name: Wait for the ingress controller DaemonSet to roll out
+  ansible.builtin.command: >-
+    {{ kubectl_bin }} --kubeconfig {{ kubeconfig_path }}
+    -n {{ ingress_namespace }} rollout status ds/ingress-nginx-controller --timeout=600s
+  changed_when: false
+
+# --- Rancher ---------------------------------------------------------------
+
+- name: Install or upgrade Rancher
+  ansible.builtin.include_tasks: helm_release.yml
+  vars:
+    release_name: rancher
+    release_namespace: "{{ rancher_namespace }}"
+    release_chart: rancher-stable/rancher
+    release_version: "{{ rancher_chart_version }}"
+    release_values_file: /etc/rancher/platform-values/rancher.yaml
+    release_timeout: 15m
+
+- name: Wait for the Rancher deployment to roll out
+  ansible.builtin.command: >-
+    {{ kubectl_bin }} --kubeconfig {{ kubeconfig_path }}
+    -n {{ rancher_namespace }} rollout status deploy/rancher --timeout=900s
+  changed_when: false
+
+- name: Wait for Rancher to answer its health endpoint
+  ansible.builtin.uri:
+    url: "https://{{ rancher_hostname }}/healthz"
+    validate_certs: false
+    status_code: [200]
+    timeout: 20
+  register: rancher_health
+  retries: 40
+  delay: 15
+  until: rancher_health.status | default(0) == 200
+
+- name: Report Rancher availability
+  ansible.builtin.debug:
+    msg: "Rancher is ready at https://{{ rancher_hostname }}"
+
+# --- application namespace -------------------------------------------------
+
+- name: Ensure the application namespace exists
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    {{ kubectl_bin }} --kubeconfig {{ kubeconfig_path }}
+    create namespace {{ app_namespace }} --dry-run=client -o yaml |
+    {{ kubectl_bin }} --kubeconfig {{ kubeconfig_path }} apply -f -
+  args:
+    executable: /bin/bash
+  register: app_ns
+  changed_when: "'created' in app_ns.stdout or 'configured' in app_ns.stdout"

@@ -1,0 +1,99 @@
+# Default values for the employee-api chart.
+# image.repository / image.tag / ingress.host are overridden per deployment by
+# the release stage (deploy-employee-api.sh).
+
+replicaCount: 2
+
+image:
+  repository: ghcr.io/OWNER/employee-api
+  # Always an immutable commit-sha tag in CI; "latest" is pushed but never deployed.
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ghcr-pull-secret
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: nginx
+  host: api.127.0.0.1.sslip.io
+  path: /
+  pathType: Prefix
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+
+resources:
+  requests:
+    cpu: 150m
+    memory: 384Mi
+  limits:
+    # No CPU limit on purpose: CPU limits throttle JVM startup. Memory is
+    # capped so a leaking pod cannot take down its node.
+    memory: 768Mi
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 60
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 6
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 25
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 6
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 30
+
+# Spread replicas across worker nodes where possible.
+topologySpreadEnabled: true
+
+nodeSelector: {}
+tolerations: []
+
+env:
+  - name: JAVA_OPTS
+    value: "-XX:MaxRAMPercentage=70.0 -XX:+UseSerialGC"

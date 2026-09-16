@@ -1,0 +1,58 @@
+# Managed by Ansible - do not edit by hand.
+# ingress-nginx {{ ingress_nginx_chart_version }}
+#
+# The controller runs as a hostNetwork DaemonSet pinned to the control-plane
+# node, because that is the node carrying the Elastic IP that public traffic
+# arrives on. No cloud load balancer is provisioned.
+
+controller:
+  kind: DaemonSet
+  hostNetwork: true
+  hostPort:
+    enabled: true
+    ports:
+      http: 80
+      https: 443
+  dnsPolicy: ClusterFirstWithHostNet
+
+  service:
+    enabled: false
+
+  ingressClassResource:
+    name: nginx
+    enabled: true
+    default: true
+    controllerValue: "k8s.io/ingress-nginx"
+
+  # Pin to the control-plane node that owns the Elastic IP.
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+    - key: CriticalAddonsOnly
+      operator: Exists
+
+  config:
+    use-forwarded-headers: "true"
+    proxy-body-size: "20m"
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+
+  admissionWebhooks:
+    enabled: true
+    patch:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: CriticalAddonsOnly
+          operator: Exists

@@ -1,0 +1,47 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+.terraformrc
+terraform.rc
+# Never commit variable files: they are the usual accidental secret leak.
+*.tfvars
+*.tfvars.json
+
+# Ansible
+ansible/inventory.ini
+*.retry
+ansible/roles/**/files/*.key
+
+# Java / Gradle
+app/build/
+app/.gradle/
+app/out/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+*.log
+
+# SSH / secrets
+*.pem
+deploy_key*
+.env
+.env.*
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+
+# Editors / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+
+# k6
+k6-results.json

@@ -1,0 +1,112 @@
+plugins {
+    id 'java'
+    id 'jacoco'
+    id 'org.springframework.boot' version '3.3.4'
+    id 'io.spring.dependency-management' version '1.1.6'
+}
+
+group = 'com.udap.platform'
+version = '1.0.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+// Dedicated source set for tests that run against a DEPLOYED instance.
+// Kept out of `test` so unit tests never require a live environment.
+sourceSets {
+    integrationTest {
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
+configurations {
+    integrationTestImplementation.extendsFrom testImplementation
+    integrationTestRuntimeOnly.extendsFrom testRuntimeOnly
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-actuator'
+    implementation 'org.springframework.boot:spring-boot-starter-validation'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+    integrationTestImplementation 'io.rest-assured:rest-assured:5.5.0'
+    integrationTestImplementation 'org.junit.jupiter:junit-jupiter:5.10.3'
+    integrationTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat = 'full'
+    }
+}
+
+tasks.named('jacocoTestReport') {
+    dependsOn tasks.named('test')
+    reports {
+        xml.required = true
+        html.required = true
+    }
+    // The Spring Boot entry point is never exercised by unit tests; counting it
+    // measures nothing useful.
+    afterEvaluate {
+        classDirectories.setFrom(files(classDirectories.files.collect {
+            fileTree(dir: it, exclude: ['**/EmployeeApiApplication.class'])
+        }))
+    }
+}
+
+// Coverage floor. This is a quality gate: raise it as the project grows,
+// never lower it to make a red build green.
+tasks.named('jacocoTestCoverageVerification') {
+    dependsOn tasks.named('jacocoTestReport')
+    violationRules {
+        rule {
+            element = 'BUNDLE'
+            excludes = ['com.udap.platform.employeeapi.EmployeeApiApplication']
+            limit {
+                counter = 'INSTRUCTION'
+                value = 'COVEREDRATIO'
+                minimum = 0.70
+            }
+        }
+    }
+}
+
+// Integration / REST Assured tests run against a deployed base URL:
+//   gradle integrationTest -Papi.base.url=http://api.<ip>.sslip.io
+tasks.register('integrationTest', Test) {
+    description = 'Runs REST Assured API and integration tests against a deployed instance.'
+    group = 'verification'
+
+    testClassesDirs = sourceSets.integrationTest.output.classesDirs
+    classpath = sourceSets.integrationTest.runtimeClasspath
+
+    useJUnitPlatform()
+    systemProperty 'api.base.url', project.findProperty('api.base.url') ?: 'http://localhost:8080'
+
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat = 'full'
+        showStandardStreams = true
+    }
+
+    // Always re-run: the target environment changes between invocations.
+    outputs.upToDateWhen { false }
+}
+
+tasks.named('bootJar') {
+    archiveFileName = 'employee-api.jar'
+}

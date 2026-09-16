@@ -1,0 +1,39 @@
+---
+# Reusable idempotent Helm release installer.
+#
+# Required vars: release_name, release_namespace, release_chart,
+#                release_version, release_values_file, release_timeout
+
+- name: "Read current revision of {{ release_name }}"
+  ansible.builtin.command: >-
+    {{ helm_bin }} status {{ release_name }}
+    -n {{ release_namespace }} -o json
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  register: helm_status_before
+  changed_when: false
+  failed_when: false
+
+- name: "Record the pre-existing revision of {{ release_name }}"
+  ansible.builtin.set_fact:
+    helm_revision_before: >-
+      {{ (helm_status_before.stdout | from_json).version
+         if helm_status_before.rc == 0 and helm_status_before.stdout | length > 0
+         else 0 }}
+
+- name: "Install or upgrade {{ release_name }}"
+  ansible.builtin.command: >-
+    {{ helm_bin }} upgrade --install {{ release_name }} {{ release_chart }}
+    --namespace {{ release_namespace }}
+    --create-namespace
+    --version {{ release_version }}
+    --values {{ release_values_file }}
+    --wait
+    --timeout {{ release_timeout }}
+    --output json
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path }}"
+  register: helm_upgrade
+  changed_when: >-
+    (helm_upgrade.stdout | from_json).version | int != helm_revision_before | int
+  no_log: "{{ release_name == 'rancher' }}"

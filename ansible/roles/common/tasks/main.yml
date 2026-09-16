@@ -1,0 +1,119 @@
+---
+# OS-level prerequisites shared by every RKE2 node.
+# Note: no cache_valid_time - cloud images ship a stale-but-recent apt cache
+# that makes the refresh a no-op and the installs 404.
+
+- name: Wait for cloud-init to finish
+  ansible.builtin.command: cloud-init status --wait
+  changed_when: false
+  failed_when: false
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+  register: apt_update
+  until: apt_update is succeeded
+  retries: 10
+  delay: 15
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - ca-certificates
+      - gnupg
+      - iptables
+      - jq
+      - nfs-common
+      - open-iscsi
+      - python3
+      - python3-pip
+      - tar
+      - unzip
+    state: present
+  register: base_packages
+  until: base_packages is succeeded
+  retries: 5
+  delay: 15
+
+# Kubernetes requires swap to be off. Ubuntu cloud images normally ship without
+# it, so both tasks are usually no-ops - but they must stay idempotent when it
+# IS present.
+- name: Check whether swap is currently active
+  ansible.builtin.command: swapon --noheadings --show=NAME
+  register: active_swap
+  changed_when: false
+  failed_when: false
+
+- name: Disable swap for the current boot
+  ansible.builtin.command: swapoff -a
+  when: active_swap.stdout | trim | length > 0
+  changed_when: true
+
+- name: Remove swap entries from /etc/fstab
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^(\s*[^#\n]+\s+swap\s+.*)$'
+    replace: '# \1'
+
+- name: Load kernel modules required by containerd and the CNI
+  community.general.modprobe:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - overlay
+    - br_netfilter
+
+- name: Persist kernel modules across reboots
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/rke2.conf
+    content: |
+      overlay
+      br_netfilter
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Apply Kubernetes sysctl settings
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/99-rke2.conf
+    reload: true
+    state: present
+  loop:
+    - { name: net.bridge.bridge-nf-call-iptables, value: "1" }
+    - { name: net.bridge.bridge-nf-call-ip6tables, value: "1" }
+    - { name: net.ipv4.ip_forward, value: "1" }
+    - { name: fs.inotify.max_user_instances, value: "8192" }
+    - { name: fs.inotify.max_user_watches, value: "524288" }
+    - { name: vm.max_map_count, value: "262144" }
+
+- name: Raise the open-file limit for container workloads
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/99-rke2.conf
+    content: |
+      * soft nofile 65535
+      * hard nofile 65535
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Ensure the RKE2 configuration directory exists
+  ansible.builtin.file:
+    path: "{{ rke2_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# The CloudWatch agent is configured to tail this file; create it only when it
+# does not already exist so the task stays idempotent.
+- name: Ensure the RKE2 install log exists for the CloudWatch agent
+  ansible.builtin.copy:
+    dest: /var/log/rke2-install.log
+    content: ""
+    force: false
+    owner: root
+    group: root
+    mode: "0644"

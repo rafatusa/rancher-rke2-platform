@@ -1,0 +1,31 @@
+# Managed by Ansible - do not edit by hand.
+# Rancher {{ rancher_chart_version }}
+#
+# TLS source "rancher" means cert-manager issues a self-signed certificate for
+# {{ rancher_hostname }}. No public domain was supplied, so ACME/Let's Encrypt
+# is not usable; switch ingress.tls.source to "letsEncrypt" and set
+# letsEncrypt.email once a real hostname exists.
+
+hostname: "{{ rancher_hostname }}"
+replicas: {{ rancher_replicas | int }}
+bootstrapPassword: "{{ rancher_bootstrap_password }}"
+
+ingress:
+  enabled: true
+  ingressClassName: nginx
+  tls:
+    source: rancher
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 1Gi
+
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+  - key: CriticalAddonsOnly
+    operator: Exists
+
+antiAffinity: preferred

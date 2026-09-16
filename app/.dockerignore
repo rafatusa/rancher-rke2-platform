@@ -1,0 +1,12 @@
+.git
+.gitignore
+build/
+.gradle/
+gradle/
+gradlew
+gradlew.bat
+*.md
+.env*
+.idea/
+*.iml
+src/integrationTest/

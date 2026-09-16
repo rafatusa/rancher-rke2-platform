@@ -1,0 +1,34 @@
+---
+# Versions are pinned so a re-run never silently upgrades a live cluster.
+rke2_version: "v1.30.5+rke2r1"
+
+helm_version: "v3.15.4"
+
+cert_manager_version: "v1.15.3"
+ingress_nginx_chart_version: "4.11.2"
+rancher_chart_version: "2.9.2"
+
+# Namespaces
+cert_manager_namespace: cert-manager
+ingress_namespace: ingress-nginx
+rancher_namespace: cattle-system
+app_namespace: employee-api
+
+# Rancher hostname is derived from the master Elastic IP through sslip.io,
+# which resolves <anything>.<ip>.sslip.io to that IP. Swap this for a real
+# domain (and a real ACME issuer) when one is available.
+rancher_hostname: "rancher.{{ master_public_ip }}.sslip.io"
+api_hostname: "api.{{ master_public_ip }}.sslip.io"
+
+# Rancher replica count: single-master platform, so a single replica.
+rancher_replicas: 1
+
+# Paths
+rke2_config_dir: /etc/rancher/rke2
+kubeconfig_path: /etc/rancher/rke2/rke2.yaml
+kubectl_bin: /var/lib/rancher/rke2/bin/kubectl
+helm_bin: /usr/local/bin/helm
+
+# Bootstrap password for the Rancher admin user. Supplied by CI via
+# -e rancher_bootstrap_password=... (repo secret RANCHER_BOOTSTRAP_PASSWORD).
+rancher_bootstrap_password: ""

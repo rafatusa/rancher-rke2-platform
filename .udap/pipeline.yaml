@@ -1,0 +1,476 @@
+version: 1
+name: rancher-rke2-platform
+vcs: github
+
+rollback:
+  strategy: manual
+
+stages:
+  - id: lint
+    kind: lint
+    timeout_minutes: 15
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - name: Compile sources
+        working-directory: app
+        run: gradle --no-daemon compileJava compileTestJava compileIntegrationTestJava
+
+  - id: test
+    kind: test
+    needs: [lint]
+    timeout_minutes: 30
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - name: Unit tests + JaCoCo coverage verification
+        working-directory: app
+        run: gradle --no-daemon test jacocoTestReport jacocoTestCoverageVerification
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: app/build/reports/jacoco/test
+
+  - id: build
+    kind: build
+    needs: [test]
+    timeout_minutes: 25
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - name: Gradle bootJar
+        working-directory: app
+        run: gradle --no-daemon bootJar
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: employee-api-jar
+          path: app/build/libs/employee-api.jar
+
+  - id: image
+    kind: build_push
+    needs: [build]
+    timeout_minutes: 30
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute image reference
+        id: imageref
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${OWNER}/employee-api" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          push: true
+          tags: |
+            ${{ steps.imageref.outputs.image }}:${{ steps.imageref.outputs.tag }}
+            ${{ steps.imageref.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  - id: provision
+    kind: provision
+    needs: [image]
+    timeout_minutes: 45
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_aws_region: us-east-1
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+    steps:
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+      - name: Terraform validate
+        working-directory: infra
+        run: terraform validate
+      - name: Terraform apply
+        working-directory: infra
+        run: terraform apply -input=false -auto-approve
+
+  - id: configure
+    kind: configure
+    needs: [provision]
+    timeout_minutes: 120
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_aws_region: us-east-1
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+    steps:
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Install Ansible
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "ansible-core>=2.16,<2.18"
+          ansible-galaxy collection install community.general ansible.posix
+          ansible --version
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+      - name: Read master IP
+        id: tfout
+        working-directory: infra
+        run: echo "master_ip=$(terraform output -raw master_public_ip)" >> "$GITHUB_OUTPUT"
+      - name: Write SSH key
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+      - name: Wait for SSH on the master
+        env:
+          MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+        run: |
+          for i in $(seq 1 40); do
+            if ssh-keyscan -T 10 -H "$MASTER_IP" >> ~/.ssh/known_hosts 2>/dev/null; then
+              if grep -q "$MASTER_IP" ~/.ssh/known_hosts; then
+                echo "sshd is up on the master"
+                exit 0
+              fi
+            fi
+            echo "waiting for sshd on the master ($i/40)"
+            sleep 15
+          done
+          echo "master did not become reachable over SSH" >&2
+          exit 1
+      - name: Generate Ansible inventory
+        working-directory: infra
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          python3 ../scripts/gen_inventory.py > ../ansible/inventory.ini
+          grep -v 'rke2_token' ../ansible/inventory.ini
+      - name: Run Ansible playbook
+        working-directory: ansible
+        env:
+          RANCHER_BOOTSTRAP_PASSWORD: ${{ secrets.RANCHER_BOOTSTRAP_PASSWORD }}
+        run: |
+          ansible-playbook -i inventory.ini site.yml \
+            -e "rancher_bootstrap_password=${RANCHER_BOOTSTRAP_PASSWORD}"
+
+  - id: release
+    kind: custom
+    needs: [configure]
+    timeout_minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_aws_region: us-east-1
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+    steps:
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+      - name: Read master IP
+        id: tfout
+        working-directory: infra
+        run: echo "master_ip=$(terraform output -raw master_public_ip)" >> "$GITHUB_OUTPUT"
+      - name: Write SSH key
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -T 20 -H "$MASTER_IP" >> ~/.ssh/known_hosts
+      - name: Copy the Helm chart to the master
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+        run: |
+          ssh -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" \
+            "rm -rf /tmp/employee-api-chart && mkdir -p /tmp/employee-api-chart"
+          scp -i ~/.ssh/deploy_key -r charts/employee-api/. \
+            "$SSH_USER@$MASTER_IP:/tmp/employee-api-chart/"
+      - name: Deploy with Helm and wait for the rollout
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_CREDENTIAL: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/employee-api"
+          TAG="${GITHUB_SHA::12}"
+          # The registry credential is piped over stdin so it never appears in
+          # the remote process list or shell history.
+          printf '%s\n' "$REGISTRY_CREDENTIAL" | ssh -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" \
+            "sudo /usr/local/bin/deploy-employee-api.sh '$IMAGE' '$TAG' '$REGISTRY_USER' '$MASTER_IP'"
+
+  - id: verify
+    kind: verify
+    needs: [provision, configure, release]
+    timeout_minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_aws_region: us-east-1
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+    steps:
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+      - name: Read master IP
+        id: tfout
+        working-directory: infra
+        run: echo "master_ip=$(terraform output -raw master_public_ip)" >> "$GITHUB_OUTPUT"
+      - name: Write SSH key
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -T 20 -H "$MASTER_IP" >> ~/.ssh/known_hosts
+      - name: Kubernetes cluster health checks
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+        run: ssh -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" "sudo /usr/local/bin/cluster-health.sh"
+      - name: Employee API is healthy through the ingress
+        env:
+          MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+        run: |
+          curl --fail --show-error --silent --retry 20 --retry-delay 15 --retry-all-errors \
+            "http://api.${MASTER_IP}.sslip.io/health"
+          echo
+      - name: Rancher UI is reachable
+        env:
+          MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+        run: |
+          curl --fail --show-error --silent --insecure --retry 20 --retry-delay 15 \
+            --retry-all-errors -o /dev/null "https://rancher.${MASTER_IP}.sslip.io/healthz"
+          echo "Rancher healthz OK"
+      - name: Deployment summary
+        env:
+          MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+        run: |
+          {
+            echo "### Rancher RKE2 Platform is live"
+            echo ""
+            echo "| Endpoint | URL |"
+            echo "| --- | --- |"
+            echo "| Rancher UI | https://rancher.${MASTER_IP}.sslip.io |"
+            echo "| Employee API | http://api.${MASTER_IP}.sslip.io |"
+            echo "| Health | http://api.${MASTER_IP}.sslip.io/health |"
+            echo "| Employees | http://api.${MASTER_IP}.sslip.io/employees |"
+            echo ""
+            echo "Cluster: 1 RKE2 server + 3 RKE2 agents."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+pipelines:
+  - id: validation
+    stages:
+      - id: k8s_health
+        kind: verify
+        timeout_minutes: 25
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
+          AWS_DEFAULT_REGION: us-east-1
+          TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+          TF_VAR_aws_region: us-east-1
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+        steps:
+          - name: Set up Terraform
+            uses: hashicorp/setup-terraform@v3
+            with:
+              terraform_wrapper: false
+          - name: Terraform init
+            working-directory: infra
+            run: |
+              terraform init -input=false -reconfigure \
+                -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+                -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+                -backend-config="region=us-east-1"
+          - name: Read master IP
+            id: tfout
+            working-directory: infra
+            run: echo "master_ip=$(terraform output -raw master_public_ip)" >> "$GITHUB_OUTPUT"
+          - name: Write SSH key
+            env:
+              SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+              MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+            run: |
+              mkdir -p ~/.ssh
+              printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+              chmod 600 ~/.ssh/deploy_key
+              ssh-keyscan -T 20 -H "$MASTER_IP" >> ~/.ssh/known_hosts
+          - name: Nodes Ready, pods Running, Helm releases healthy, Rancher up
+            env:
+              SSH_USER: ${{ secrets.SSH_USER }}
+              MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+            run: ssh -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" "sudo /usr/local/bin/cluster-health.sh"
+
+      - id: smoke
+        kind: e2e
+        needs: [k8s_health]
+        timeout_minutes: 30
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
+          AWS_DEFAULT_REGION: us-east-1
+          TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+          TF_VAR_aws_region: us-east-1
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+        steps:
+          - name: Set up JDK 17
+            uses: actions/setup-java@v4
+            with:
+              distribution: temurin
+              java-version: "17"
+          - name: Set up Gradle
+            uses: gradle/actions/setup-gradle@v4
+            with:
+              gradle-version: "8.10.2"
+          - name: Set up Terraform
+            uses: hashicorp/setup-terraform@v3
+            with:
+              terraform_wrapper: false
+          - name: Terraform init
+            working-directory: infra
+            run: |
+              terraform init -input=false -reconfigure \
+                -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+                -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+                -backend-config="region=us-east-1"
+          - name: Read master IP
+            id: tfout
+            working-directory: infra
+            run: echo "master_ip=$(terraform output -raw master_public_ip)" >> "$GITHUB_OUTPUT"
+          - name: Smoke tests
+            env:
+              MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+            run: |
+              chmod +x scripts/smoke-test.sh
+              ./scripts/smoke-test.sh "$MASTER_IP"
+          - name: REST Assured API and integration tests
+            working-directory: app
+            env:
+              MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+            run: gradle --no-daemon integrationTest -Papi.base.url="http://api.${MASTER_IP}.sslip.io"
+          - name: Upload integration test report
+            uses: actions/upload-artifact@v4
+            with:
+              name: integration-test-report
+              path: app/build/reports/tests/integrationTest
+
+      - id: load
+        kind: perf
+        needs: [smoke]
+        timeout_minutes: 25
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
+          AWS_DEFAULT_REGION: us-east-1
+          TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+          TF_VAR_aws_region: us-east-1
+          TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+        steps:
+          - name: Set up Terraform
+            uses: hashicorp/setup-terraform@v3
+            with:
+              terraform_wrapper: false
+          - name: Terraform init
+            working-directory: infra
+            run: |
+              terraform init -input=false -reconfigure \
+                -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+                -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+                -backend-config="region=us-east-1"
+          - name: Read master IP
+            id: tfout
+            working-directory: infra
+            run: echo "master_ip=$(terraform output -raw master_public_ip)" >> "$GITHUB_OUTPUT"
+          - name: Install k6
+            run: |
+              curl -fsSL https://github.com/grafana/k6/releases/download/v0.54.0/k6-v0.54.0-linux-amd64.tar.gz -o /tmp/k6.tar.gz
+              tar -xzf /tmp/k6.tar.gz -C /tmp
+              sudo install /tmp/k6-v0.54.0-linux-amd64/k6 /usr/local/bin/k6
+              k6 version
+          - name: k6 load test
+            env:
+              MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+            run: k6 run -e BASE_URL="http://api.${MASTER_IP}.sslip.io" tests/k6/load-test.js

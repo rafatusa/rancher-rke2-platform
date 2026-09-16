@@ -1,0 +1,89 @@
+---
+# RKE2 agent (worker) nodes join the control plane over the supervisor port.
+
+- name: Write RKE2 agent configuration
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: "{{ rke2_config_dir }}/config.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Restart rke2-agent
+
+- name: Wait for the control-plane supervisor port to be reachable
+  ansible.builtin.wait_for:
+    host: "{{ master_private_ip }}"
+    port: 9345
+    timeout: 900
+    delay: 5
+
+- name: Check whether the RKE2 agent binary is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/rke2
+  register: rke2_binary
+
+- name: Download the RKE2 installer
+  ansible.builtin.get_url:
+    url: https://get.rke2.io
+    dest: /usr/local/share/rke2-install.sh
+    mode: "0755"
+  when: not rke2_binary.stat.exists
+
+- name: Install the RKE2 agent
+  ansible.builtin.command: /usr/local/share/rke2-install.sh
+  environment:
+    INSTALL_RKE2_TYPE: agent
+    INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+  args:
+    creates: /usr/local/bin/rke2
+  when: not rke2_binary.stat.exists
+
+- name: Enable and start rke2-agent
+  ansible.builtin.systemd:
+    name: rke2-agent
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Flush handlers so a config change restarts the agent before verification
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for the kubelet to come up on this node
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 10250
+    timeout: 900
+    delay: 10
+
+# Node registration is verified from the control plane, which is the only host
+# holding a kubeconfig.
+- name: Wait for this node to register with the cluster
+  ansible.builtin.command: >-
+    {{ kubectl_bin }} --kubeconfig {{ kubeconfig_path }}
+    get node {{ inventory_hostname }}
+  delegate_to: "{{ groups['rke2_server'][0] }}"
+  register: node_registered
+  changed_when: false
+  failed_when: false
+  retries: 30
+  delay: 20
+  until: node_registered.rc == 0
+
+- name: Fail clearly when the node never registered
+  ansible.builtin.fail:
+    msg: >-
+      Node {{ inventory_hostname }} did not register with the cluster.
+      Check `journalctl -u rke2-agent` on this host and confirm port 9345
+      on the master is reachable.
+  when: node_registered.rc != 0
+
+- name: Wait for this node to report Ready
+  ansible.builtin.command: >-
+    {{ kubectl_bin }} --kubeconfig {{ kubeconfig_path }}
+    wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=300s
+  delegate_to: "{{ groups['rke2_server'][0] }}"
+  register: node_ready
+  changed_when: false
+  retries: 5
+  delay: 30
+  until: node_ready.rc == 0

@@ -1,0 +1,179 @@
+---
+# RKE2 server (control plane) + cluster-admin tooling on the master node.
+
+- name: Write RKE2 server configuration
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: "{{ rke2_config_dir }}/config.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Restart rke2-server
+
+- name: Check whether the RKE2 server binary is already installed
+  ansible.builtin.stat:
+    path: /usr/local/bin/rke2
+  register: rke2_binary
+
+- name: Download the RKE2 installer
+  ansible.builtin.get_url:
+    url: https://get.rke2.io
+    dest: /usr/local/share/rke2-install.sh
+    mode: "0755"
+  when: not rke2_binary.stat.exists
+
+- name: Install the RKE2 server
+  ansible.builtin.command: /usr/local/share/rke2-install.sh
+  environment:
+    INSTALL_RKE2_TYPE: server
+    INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+  args:
+    creates: /usr/local/bin/rke2
+  when: not rke2_binary.stat.exists
+
+- name: Enable and start rke2-server
+  ansible.builtin.systemd:
+    name: rke2-server
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Flush handlers so a config change restarts the server before we wait on it
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for the Kubernetes API to accept connections
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 6443
+    timeout: 900
+    delay: 10
+
+- name: Wait for the kubeconfig to be written
+  ansible.builtin.wait_for:
+    path: "{{ kubeconfig_path }}"
+    timeout: 300
+
+- name: Wait for the control-plane node to report Ready
+  ansible.builtin.command: >-
+    {{ kubectl_bin }} --kubeconfig {{ kubeconfig_path }}
+    wait --for=condition=Ready node/{{ inventory_hostname }} --timeout=300s
+  register: master_ready
+  changed_when: false
+  retries: 10
+  delay: 30
+  until: master_ready.rc == 0
+
+# --- cluster admin tooling -------------------------------------------------
+
+- name: Symlink kubectl into PATH
+  ansible.builtin.file:
+    src: "{{ kubectl_bin }}"
+    dest: /usr/local/bin/kubectl
+    state: link
+    force: true
+
+- name: Ensure root kube config directory exists
+  ansible.builtin.file:
+    path: /root/.kube
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Install kubeconfig for root
+  ansible.builtin.copy:
+    src: "{{ kubeconfig_path }}"
+    dest: /root/.kube/config
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Ensure kube config directory exists for the login user
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/.kube"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0700"
+
+- name: Install kubeconfig for the login user
+  ansible.builtin.copy:
+    src: "{{ kubeconfig_path }}"
+    dest: "/home/{{ ansible_user }}/.kube/config"
+    remote_src: true
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0600"
+
+- name: Export KUBECONFIG and the RKE2 bin path system-wide
+  ansible.builtin.copy:
+    dest: /etc/profile.d/rke2.sh
+    content: |
+      export KUBECONFIG={{ kubeconfig_path }}
+      export PATH=$PATH:/var/lib/rancher/rke2/bin
+    owner: root
+    group: root
+    mode: "0644"
+
+# --- Helm ------------------------------------------------------------------
+
+- name: Check whether Helm is installed
+  ansible.builtin.stat:
+    path: "{{ helm_bin }}"
+  register: helm_binary
+
+- name: Read the installed Helm version
+  ansible.builtin.command: "{{ helm_bin }} version --short"
+  register: helm_installed_version
+  changed_when: false
+  failed_when: false
+  when: helm_binary.stat.exists
+
+- name: Decide whether Helm needs installing
+  ansible.builtin.set_fact:
+    helm_needs_install: >-
+      {{ not helm_binary.stat.exists
+         or helm_version not in (helm_installed_version.stdout | default('')) }}
+
+- name: Download Helm
+  ansible.builtin.get_url:
+    url: "https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz"
+    dest: "/tmp/helm-{{ helm_version }}.tar.gz"
+    mode: "0644"
+  when: helm_needs_install
+
+- name: Unpack Helm
+  ansible.builtin.unarchive:
+    src: "/tmp/helm-{{ helm_version }}.tar.gz"
+    dest: /tmp
+    remote_src: true
+  when: helm_needs_install
+
+- name: Install the Helm binary
+  ansible.builtin.copy:
+    src: /tmp/linux-amd64/helm
+    dest: "{{ helm_bin }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+  when: helm_needs_install
+
+# --- operational scripts ---------------------------------------------------
+
+- name: Install the cluster health check script
+  ansible.builtin.template:
+    src: cluster-health.sh.j2
+    dest: /usr/local/bin/cluster-health.sh
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the Employee API deploy script
+  ansible.builtin.template:
+    src: deploy-employee-api.sh.j2
+    dest: /usr/local/bin/deploy-employee-api.sh
+    owner: root
+    group: root
+    mode: "0755"
