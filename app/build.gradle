@@ -18,6 +18,10 @@ repositories {
     mavenCentral()
 }
 
+// Classes excluded from coverage measurement. The Spring Boot entry point is
+// never exercised by unit tests, so counting it measures nothing useful.
+def coverageExclusions = ['**/EmployeeApiApplication.class']
+
 // Dedicated source set for tests that run against a DEPLOYED instance.
 // Kept out of `test` so unit tests never require a live environment.
 sourceSets {
@@ -45,6 +49,12 @@ dependencies {
     integrationTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
+// Coverage is measured over main's compiled classes minus the exclusions.
+// Declared once, as a lazy provider, and reused by both JaCoCo tasks.
+def coveredClasses = sourceSets.main.output.classesDirs.asFileTree.matching {
+    exclude coverageExclusions
+}
+
 tasks.named('test') {
     useJUnitPlatform()
     testLogging {
@@ -59,23 +69,20 @@ tasks.named('jacocoTestReport') {
         xml.required = true
         html.required = true
     }
-    // The Spring Boot entry point is never exercised by unit tests; counting it
-    // measures nothing useful.
-    afterEvaluate {
-        classDirectories.setFrom(files(classDirectories.files.collect {
-            fileTree(dir: it, exclude: ['**/EmployeeApiApplication.class'])
-        }))
-    }
+    // Set directly on the task. Do NOT wrap this in afterEvaluate: registering
+    // an afterEvaluate callback from inside a tasks.named block is illegal and
+    // fails configuration with "cannot be executed in the current context".
+    classDirectories.setFrom(coveredClasses)
 }
 
 // Coverage floor. This is a quality gate: raise it as the project grows,
 // never lower it to make a red build green.
 tasks.named('jacocoTestCoverageVerification') {
     dependsOn tasks.named('jacocoTestReport')
+    classDirectories.setFrom(coveredClasses)
     violationRules {
         rule {
             element = 'BUNDLE'
-            excludes = ['com.udap.platform.employeeapi.EmployeeApiApplication']
             limit {
                 counter = 'INSTRUCTION'
                 value = 'COVEREDRATIO'
