@@ -175,19 +175,54 @@ stages:
       - name: Wait for SSH on the master
         env:
           MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+          SSH_USER: ${{ secrets.SSH_USER }}
         run: |
+          # Probe the capability we actually need: an authenticated SSH session.
+          # StrictHostKeyChecking=accept-new records the host key on first contact,
+          # so this both proves access and populates known_hosts for later steps.
           for i in $(seq 1 40); do
-            if ssh-keyscan -T 10 -H "$MASTER_IP" >> ~/.ssh/known_hosts 2>/dev/null; then
-              if grep -q "$MASTER_IP" ~/.ssh/known_hosts; then
-                echo "sshd is up on the master"
-                exit 0
-              fi
+            if ssh -i ~/.ssh/deploy_key \
+                   -o StrictHostKeyChecking=accept-new \
+                   -o ConnectTimeout=10 \
+                   -o BatchMode=yes \
+                   "$SSH_USER@$MASTER_IP" true 2>/dev/null; then
+              echo "SSH to the master is ready (attempt $i)"
+              exit 0
             fi
             echo "waiting for sshd on the master ($i/40)"
             sleep 15
           done
           echo "master did not become reachable over SSH" >&2
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=10 -o BatchMode=yes -v \
+              "$SSH_USER@$MASTER_IP" true || true
           exit 1
+      - name: Wait for SSH on the workers
+        working-directory: infra
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          # Ansible targets the workers too — make sure they are reachable
+          # before the playbook starts, so a slow worker fails here with a
+          # clear message rather than mid-play.
+          for ip in $(terraform output -json worker_public_ips | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)))'); do
+            for i in $(seq 1 40); do
+              if ssh -i ~/.ssh/deploy_key \
+                     -o StrictHostKeyChecking=accept-new \
+                     -o ConnectTimeout=10 \
+                     -o BatchMode=yes \
+                     "$SSH_USER@$ip" true 2>/dev/null; then
+                echo "SSH to $ip is ready (attempt $i)"
+                break
+              fi
+              if [ "$i" -eq 40 ]; then
+                echo "worker $ip did not become reachable over SSH" >&2
+                exit 1
+              fi
+              echo "waiting for sshd on $ip ($i/40)"
+              sleep 15
+            done
+          done
       - name: Generate Ansible inventory
         working-directory: infra
         env:
@@ -234,20 +269,19 @@ stages:
       - name: Write SSH key
         env:
           SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -T 20 -H "$MASTER_IP" >> ~/.ssh/known_hosts
       - name: Copy the Helm chart to the master
         env:
           SSH_USER: ${{ secrets.SSH_USER }}
           MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
         run: |
-          ssh -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" \
+          SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+          ssh $SSH_OPTS -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" \
             "rm -rf /tmp/employee-api-chart && mkdir -p /tmp/employee-api-chart"
-          scp -i ~/.ssh/deploy_key -r charts/employee-api/. \
+          scp $SSH_OPTS -i ~/.ssh/deploy_key -r charts/employee-api/. \
             "$SSH_USER@$MASTER_IP:/tmp/employee-api-chart/"
       - name: Deploy with Helm and wait for the rollout
         env:
@@ -261,7 +295,9 @@ stages:
           TAG="${GITHUB_SHA::12}"
           # The registry credential is piped over stdin so it never appears in
           # the remote process list or shell history.
-          printf '%s\n' "$REGISTRY_CREDENTIAL" | ssh -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" \
+          printf '%s\n' "$REGISTRY_CREDENTIAL" | ssh \
+            -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+            -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" \
             "sudo /usr/local/bin/deploy-employee-api.sh '$IMAGE' '$TAG' '$REGISTRY_USER' '$MASTER_IP'"
 
   - id: verify
@@ -295,17 +331,18 @@ stages:
       - name: Write SSH key
         env:
           SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -T 20 -H "$MASTER_IP" >> ~/.ssh/known_hosts
       - name: Kubernetes cluster health checks
         env:
           SSH_USER: ${{ secrets.SSH_USER }}
           MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
-        run: ssh -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" "sudo /usr/local/bin/cluster-health.sh"
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+            -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" \
+            "sudo /usr/local/bin/cluster-health.sh"
       - name: Employee API is healthy through the ingress
         env:
           MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
@@ -370,17 +407,18 @@ pipelines:
           - name: Write SSH key
             env:
               SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-              MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
             run: |
               mkdir -p ~/.ssh
               printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
               chmod 600 ~/.ssh/deploy_key
-              ssh-keyscan -T 20 -H "$MASTER_IP" >> ~/.ssh/known_hosts
           - name: Nodes Ready, pods Running, Helm releases healthy, Rancher up
             env:
               SSH_USER: ${{ secrets.SSH_USER }}
               MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
-            run: ssh -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" "sudo /usr/local/bin/cluster-health.sh"
+            run: |
+              ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+                -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" \
+                "sudo /usr/local/bin/cluster-health.sh"
 
       - id: smoke
         kind: e2e

@@ -186,13 +186,35 @@ jobs:
       env:
         SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
     - name: Wait for SSH on the master
-      run: "for i in $(seq 1 40); do\n  if ssh-keyscan -T 10 -H \"$MASTER_IP\" >>\
-        \ ~/.ssh/known_hosts 2>/dev/null; then\n    if grep -q \"$MASTER_IP\" ~/.ssh/known_hosts;\
-        \ then\n      echo \"sshd is up on the master\"\n      exit 0\n    fi\n  fi\n\
-        \  echo \"waiting for sshd on the master ($i/40)\"\n  sleep 15\ndone\necho\
-        \ \"master did not become reachable over SSH\" >&2\nexit 1\n"
+      run: "# Probe the capability we actually need: an authenticated SSH session.\n\
+        # StrictHostKeyChecking=accept-new records the host key on first contact,\n\
+        # so this both proves access and populates known_hosts for later steps.\n\
+        for i in $(seq 1 40); do\n  if ssh -i ~/.ssh/deploy_key \\\n         -o StrictHostKeyChecking=accept-new\
+        \ \\\n         -o ConnectTimeout=10 \\\n         -o BatchMode=yes \\\n   \
+        \      \"$SSH_USER@$MASTER_IP\" true 2>/dev/null; then\n    echo \"SSH to\
+        \ the master is ready (attempt $i)\"\n    exit 0\n  fi\n  echo \"waiting for\
+        \ sshd on the master ($i/40)\"\n  sleep 15\ndone\necho \"master did not become\
+        \ reachable over SSH\" >&2\nssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new\
+        \ \\\n    -o ConnectTimeout=10 -o BatchMode=yes -v \\\n    \"$SSH_USER@$MASTER_IP\"\
+        \ true || true\nexit 1\n"
       env:
         MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
+        SSH_USER: ${{ secrets.SSH_USER }}
+    - name: Wait for SSH on the workers
+      run: "# Ansible targets the workers too \u2014 make sure they are reachable\n\
+        # before the playbook starts, so a slow worker fails here with a\n# clear\
+        \ message rather than mid-play.\nfor ip in $(terraform output -json worker_public_ips\
+        \ | python3 -c 'import json,sys; print(\" \".join(json.load(sys.stdin)))');\
+        \ do\n  for i in $(seq 1 40); do\n    if ssh -i ~/.ssh/deploy_key \\\n   \
+        \        -o StrictHostKeyChecking=accept-new \\\n           -o ConnectTimeout=10\
+        \ \\\n           -o BatchMode=yes \\\n           \"$SSH_USER@$ip\" true 2>/dev/null;\
+        \ then\n      echo \"SSH to $ip is ready (attempt $i)\"\n      break\n   \
+        \ fi\n    if [ \"$i\" -eq 40 ]; then\n      echo \"worker $ip did not become\
+        \ reachable over SSH\" >&2\n      exit 1\n    fi\n    echo \"waiting for sshd\
+        \ on $ip ($i/40)\"\n    sleep 15\n  done\ndone\n"
+      working-directory: infra
+      env:
+        SSH_USER: ${{ secrets.SSH_USER }}
     - name: Generate Ansible inventory
       run: 'python3 ../scripts/gen_inventory.py > ../ansible/inventory.ini
 
@@ -243,16 +265,15 @@ jobs:
 
         chmod 600 ~/.ssh/deploy_key
 
-        ssh-keyscan -T 20 -H "$MASTER_IP" >> ~/.ssh/known_hosts
-
         '
       env:
         SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-        MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
     - name: Copy the Helm chart to the master
-      run: "ssh -i ~/.ssh/deploy_key \"$SSH_USER@$MASTER_IP\" \\\n  \"rm -rf /tmp/employee-api-chart\
-        \ && mkdir -p /tmp/employee-api-chart\"\nscp -i ~/.ssh/deploy_key -r charts/employee-api/.\
-        \ \\\n  \"$SSH_USER@$MASTER_IP:/tmp/employee-api-chart/\"\n"
+      run: "SSH_OPTS=\"-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15\"\n\
+        ssh $SSH_OPTS -i ~/.ssh/deploy_key \"$SSH_USER@$MASTER_IP\" \\\n  \"rm -rf\
+        \ /tmp/employee-api-chart && mkdir -p /tmp/employee-api-chart\"\nscp $SSH_OPTS\
+        \ -i ~/.ssh/deploy_key -r charts/employee-api/. \\\n  \"$SSH_USER@$MASTER_IP:/tmp/employee-api-chart/\"\
+        \n"
       env:
         SSH_USER: ${{ secrets.SSH_USER }}
         MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
@@ -261,7 +282,8 @@ jobs:
         IMAGE=\"ghcr.io/${OWNER}/employee-api\"\nTAG=\"${GITHUB_SHA::12}\"\n# The\
         \ registry credential is piped over stdin so it never appears in\n# the remote\
         \ process list or shell history.\nprintf '%s\\n' \"$REGISTRY_CREDENTIAL\"\
-        \ | ssh -i ~/.ssh/deploy_key \"$SSH_USER@$MASTER_IP\" \\\n  \"sudo /usr/local/bin/deploy-employee-api.sh\
+        \ | ssh \\\n  -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \\\n\
+        \  -i ~/.ssh/deploy_key \"$SSH_USER@$MASTER_IP\" \\\n  \"sudo /usr/local/bin/deploy-employee-api.sh\
         \ '$IMAGE' '$TAG' '$REGISTRY_USER' '$MASTER_IP'\"\n"
       env:
         SSH_USER: ${{ secrets.SSH_USER }}
@@ -305,14 +327,13 @@ jobs:
 
         chmod 600 ~/.ssh/deploy_key
 
-        ssh-keyscan -T 20 -H "$MASTER_IP" >> ~/.ssh/known_hosts
-
         '
       env:
         SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-        MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
     - name: Kubernetes cluster health checks
-      run: ssh -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" "sudo /usr/local/bin/cluster-health.sh"
+      run: "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \\\n  -i\
+        \ ~/.ssh/deploy_key \"$SSH_USER@$MASTER_IP\" \\\n  \"sudo /usr/local/bin/cluster-health.sh\"\
+        \n"
       env:
         SSH_USER: ${{ secrets.SSH_USER }}
         MASTER_IP: ${{ steps.tfout.outputs.master_ip }}

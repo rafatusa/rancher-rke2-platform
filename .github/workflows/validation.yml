@@ -37,14 +37,13 @@ jobs:
 
         chmod 600 ~/.ssh/deploy_key
 
-        ssh-keyscan -T 20 -H "$MASTER_IP" >> ~/.ssh/known_hosts
-
         '
       env:
         SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-        MASTER_IP: ${{ steps.tfout.outputs.master_ip }}
     - name: Nodes Ready, pods Running, Helm releases healthy, Rancher up
-      run: ssh -i ~/.ssh/deploy_key "$SSH_USER@$MASTER_IP" "sudo /usr/local/bin/cluster-health.sh"
+      run: "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \\\n  -i\
+        \ ~/.ssh/deploy_key \"$SSH_USER@$MASTER_IP\" \\\n  \"sudo /usr/local/bin/cluster-health.sh\"\
+        \n"
       env:
         SSH_USER: ${{ secrets.SSH_USER }}
         MASTER_IP: ${{ steps.tfout.outputs.master_ip }}

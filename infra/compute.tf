@@ -71,15 +71,15 @@ locals {
         files = {
           collect_list = [
             {
-              file_path       = "/var/log/syslog"
-              log_group_name  = "/${var.project_name}/syslog"
-              log_stream_name = "{instance_id}"
+              file_path         = "/var/log/syslog"
+              log_group_name    = "/${var.project_name}/syslog"
+              log_stream_name   = "{instance_id}"
               retention_in_days = 14
             },
             {
-              file_path       = "/var/log/rke2-install.log"
-              log_group_name  = "/${var.project_name}/rke2"
-              log_stream_name = "{instance_id}"
+              file_path         = "/var/log/rke2-install.log"
+              log_group_name    = "/${var.project_name}/rke2"
+              log_stream_name   = "{instance_id}"
               retention_in_days = 14
             }
           ]
@@ -88,30 +88,46 @@ locals {
     }
   })
 
-  node_user_data = <<-EOT
-    #!/bin/bash
-    set -euxo pipefail
+  # NOTE: this heredoc is deliberately written at column 0 and uses <<EOT
+  # (not <<-EOT). Terraform's <<- strips only the indentation COMMON to every
+  # line, and the interpolated JSON below sits at column 0 — so with <<-EOT the
+  # common indent computes to zero and NOTHING is stripped, leaving four spaces
+  # in front of the shebang. A shebang is only honoured when "#!" are the first
+  # two bytes of the file, so the kernel ignored it, ran the script under dash,
+  # and it died on `set -o pipefail` (dash has no pipefail). Keep column 0.
+  node_user_data = <<EOT
+#!/bin/bash
+set -euxo pipefail
 
-    # Bootstrap only: everything else is Ansible's job.
-    export DEBIAN_FRONTEND=noninteractive
-    for i in $(seq 1 10); do
-      apt-get update -y && break || sleep 15
-    done
-    apt-get install -y curl unzip
+# Bootstrap only: everything else is Ansible's job.
+export DEBIAN_FRONTEND=noninteractive
+for i in $(seq 1 10); do
+  apt-get update -y && break || sleep 15
+done
+apt-get install -y curl unzip
 
-    # CloudWatch agent
-    ARCH=$(dpkg --print-architecture)
-    curl -fsSL -o /tmp/amazon-cloudwatch-agent.deb \
-      "https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/$${ARCH}/latest/amazon-cloudwatch-agent.deb"
-    dpkg -i -E /tmp/amazon-cloudwatch-agent.deb
-    mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
-    cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWJSON'
+# CloudWatch agent. Non-fatal: RKE2 is the critical path, and a transient
+# S3/download failure must not stop the node from finishing bootstrap.
+install_cloudwatch_agent() {
+  ARCH=$(dpkg --print-architecture)
+  curl -fsSL --retry 5 --retry-delay 10 -o /tmp/amazon-cloudwatch-agent.deb \
+    "https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/$${ARCH}/latest/amazon-cloudwatch-agent.deb"
+  dpkg -i -E /tmp/amazon-cloudwatch-agent.deb
+  mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+  cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWJSON'
 ${local.cloudwatch_agent_config}
 CWJSON
-    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-      -a fetch-config -m ec2 -s \
-      -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
-  EOT
+  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config -m ec2 -s \
+    -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+}
+
+if install_cloudwatch_agent; then
+  echo "cloudwatch agent configured"
+else
+  echo "WARNING: cloudwatch agent setup failed; continuing bootstrap" >&2
+fi
+EOT
 }
 
 resource "aws_instance" "master" {
