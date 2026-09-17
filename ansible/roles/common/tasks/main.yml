@@ -56,13 +56,22 @@
     regexp: '^(\s*[^#\n]+\s+swap\s+.*)$'
     replace: '# \1'
 
+# Deliberately ansible.builtin rather than community.general.modprobe: this
+# keeps the critical path free of third-party collections, whose major
+# versions drop plugins and track ansible-core compatibility independently.
+# `lsmod` gives a precise idempotency guard, so nothing is lost.
+- name: Check which kernel modules are already loaded
+  ansible.builtin.command: lsmod
+  register: loaded_modules
+  changed_when: false
+
 - name: Load kernel modules required by containerd and the CNI
-  community.general.modprobe:
-    name: "{{ item }}"
-    state: present
+  ansible.builtin.command: "modprobe {{ item }}"
   loop:
     - overlay
     - br_netfilter
+  when: loaded_modules.stdout is not search('^' ~ item ~ '\s', multiline=True)
+  changed_when: true
 
 - name: Persist kernel modules across reboots
   ansible.builtin.copy:

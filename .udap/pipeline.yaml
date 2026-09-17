@@ -152,8 +152,20 @@ stages:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install "ansible-core>=2.16,<2.18"
-          ansible-galaxy collection install community.general ansible.posix
+          # ansible.posix is PINNED to a release that supports this ansible-core
+          # range. Unpinned galaxy installs resolve to the latest major, which
+          # tracks its own core-compatibility window and drops plugins between
+          # majors — that is how community.general 12 removed the `yaml`
+          # stdout callback and aborted the playbook before any task ran.
+          # Only ansible.posix.sysctl is used; everything else is ansible.builtin.
+          ansible-galaxy collection install "ansible.posix:>=1.5.4,<2.0.0"
           ansible --version
+      - name: Ansible syntax check
+        working-directory: ansible
+        run: |
+          # Fails in seconds if a module, plugin or collection cannot be
+          # resolved, instead of after the SSH waits several steps later.
+          ansible-playbook --syntax-check -i localhost, site.yml
       - name: Terraform init
         working-directory: infra
         run: |

@@ -36,6 +36,14 @@ The workflow's `GITHUB_TOKEN` lacks `packages: write`, or the organization
 restricts package creation. Check **Settings → Actions → Workflow permissions**
 (needs read *and* write), and organization package-creation policy.
 
+This is **account-level**: the token's permissions are identical on every run,
+so retrying reproduces the denial byte for byte. Fix the setting first.
+
+If the account cannot grant package creation, pre-create the package once with a
+PAT (`docker push ghcr.io/<owner>/employee-api:bootstrap`) and grant this repo
+Write under *Package settings → Manage Actions access*. Pushing to an existing
+package does not require the create permission.
+
 ---
 
 ## Pipeline: `provision` fails
@@ -62,6 +70,13 @@ Same root cause as above: the retry initialised a *different* state key, so
 Terraform cannot see what the previous attempt built. Fix the backend flags; the
 deterministic key means a correct retry always reconciles the partial estate.
 
+### All four instances are replaced unexpectedly
+
+Terraform replaces an instance when `user_data` changes. That is expected after
+any edit to the bootstrap script in `infra/compute.tf`. Nothing in the cluster is
+stateful by design, so a replacement is safe — but it does mean a full RKE2
+re-bootstrap (~25–40 minutes), not a quick apply.
+
 ---
 
 ## Pipeline: `configure` fails
@@ -83,19 +98,59 @@ Work in this order — do not guess.
    Does not match → the key store is inconsistent: rotate the project keys from
    Integrations. Do not burn retries on key-writing experiments.
 
-### `UNREACHABLE!` with a timeout
+### `master did not become reachable over SSH` — but SSH actually works
 
-Security group or boot timing. Port 22 is open to `ssh_ingress_cidr`
-(`0.0.0.0/0` by default). The configure stage already waits up to 10 minutes for
-`sshd`; a timeout past that means the instance failed to boot — check the EC2
-console's system log.
+Check the wait loop itself before touching infrastructure. A readiness probe must
+test the capability you need — an authenticated session:
 
-### `couldn't resolve module/action 'community.general.modprobe'`
+```bash
+ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+    -o ConnectTimeout=10 -o BatchMode=yes ubuntu@<MASTER_IP> true
+```
 
-The Galaxy collections were not installed. The *Install Ansible* step must run
-`ansible-galaxy collection install community.general ansible.posix` in the
-**same step** that installs `ansible-core`. Ansible resolves every module before
-executing anything, so this fails at parse time.
+**Never** probe by scanning host keys and grepping `known_hosts` for the IP:
+`ssh-keyscan -H` *hashes* the hostname, so its output lines look like
+`|1|<base64>|<base64>` and the plaintext IP appears only in stderr comments. A
+`grep -q "$IP" ~/.ssh/known_hosts` guard can therefore never match, and the loop
+fails after every attempt regardless of whether sshd is healthy.
+
+Confirm sshd's own view before blaming the network:
+
+```bash
+sudo journalctl -u ssh -n 50 --no-pager   # "Accepted publickey" = auth is fine
+```
+
+### `ERROR! [DEPRECATED]: community.general.yaml has been removed`
+
+A collection major version dropped a plugin the config still referenced. Use
+ansible-core's native formatting in `ansible/ansible.cfg`:
+
+```ini
+stdout_callback = default
+result_format = yaml
+```
+
+More generally: **pin Galaxy collections.** An unpinned
+`ansible-galaxy collection install <name>` resolves to the newest major, which
+tracks its own ansible-core support window and removes plugins between majors.
+This playbook needs only `ansible.posix` (for `sysctl`); everything else is
+`ansible.builtin`.
+
+Ansible resolves every module and plugin *before* running any task, so these
+failures abort the play at startup with zero tasks executed.
+
+Catch it in seconds rather than after the SSH waits:
+
+```bash
+cd ansible && ansible-playbook --syntax-check -i localhost, site.yml
+```
+
+### `couldn't resolve module/action '<collection>.<module>'`
+
+The collection is not installed, or the module moved. `ansible-core` ships only
+`ansible.builtin`. The *Install Ansible* step must install any collection in the
+**same step** as `ansible-core`. Prefer `ansible.builtin` plus an explicit
+idempotency guard over adding a collection dependency.
 
 ### `E: Unable to locate package` / `404 Not Found` on apt
 
@@ -142,6 +197,31 @@ sudo kubectl -n cattle-system logs -l app=rancher --tail=100
 | `Pending` | Not enough memory on the master. Rancher requests 1 GB and cert-manager/ingress take more. |
 | `CrashLoopBackOff` with cert errors | cert-manager was not ready when Rancher installed. Re-run configure — ordering is enforced and the retry converges. |
 | Ready, but `/healthz` times out | ingress-nginx is not on the master, so port 443 on the Elastic IP reaches nothing. Check `kubectl -n ingress-nginx get pods -o wide`. |
+
+---
+
+## Node bootstrap (cloud-init)
+
+### `cloud-init status` reports `error`
+
+```bash
+cloud-init status --long
+sudo tail -n 40 /var/log/cloud-init-output.log
+```
+
+### `set: Illegal option -o pipefail` in the cloud-init output
+
+The script ran under `/bin/sh` (dash), not bash — which means **the shebang was
+not honoured**. A shebang only counts when `#!` are the first two bytes of the
+file, so any leading whitespace disables it.
+
+In Terraform this comes from `<<-EOT`: the `-` strips only the indentation
+*common to every line*, so a single interpolated line at column 0 makes the
+common indent zero and **nothing** is stripped. Write generated `user_data` at
+column 0 with a plain `<<EOT`.
+
+Symptom to expect downstream: anything the bootstrap installed is missing — on
+this platform, the CloudWatch agent.
 
 ---
 

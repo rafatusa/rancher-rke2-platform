@@ -13,7 +13,11 @@
 #
 # Requirements:
 #   - terraform initialised in infra/ against the project's state backend
-#   - ansible-core plus community.general and ansible.posix collections
+#   - ansible-core (>=2.16,<2.18) plus the ansible.posix collection:
+#         ansible-galaxy collection install "ansible.posix:>=1.5.4,<2.0.0"
+#     Everything else the playbook uses is ansible.builtin, so no other
+#     collection is required. Pin ansible.posix: unpinned installs resolve to
+#     the newest major, which tracks its own ansible-core support window.
 #   - the project's SSH private key at ~/.ssh/deploy_key (chmod 600)
 #   - SSH_USER and RANCHER_BOOTSTRAP_PASSWORD exported
 set -euo pipefail
@@ -40,6 +44,9 @@ command -v ansible-playbook >/dev/null 2>&1 || {
   exit 1
 }
 
+echo "==> Checking the playbook resolves (modules, plugins, collections)"
+( cd "${REPO_ROOT}/ansible" && ansible-playbook --syntax-check -i localhost, site.yml )
+
 echo "==> Reading infrastructure outputs"
 cd "${REPO_ROOT}/infra"
 
@@ -57,11 +64,22 @@ SSH_USER="$SSH_USER" python3 "${REPO_ROOT}/scripts/gen_inventory.py" \
   > "${REPO_ROOT}/ansible/inventory.ini"
 grep -v 'rke2_token' "${REPO_ROOT}/ansible/inventory.ini"
 
-echo "==> Trusting host keys"
+echo "==> Verifying SSH reachability"
 mkdir -p "$HOME/.ssh"
 while read -r ip; do
   [ -n "$ip" ] || continue
-  ssh-keyscan -T 20 -H "$ip" >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+  # Probe the real capability (an authenticated session) rather than scanning
+  # host keys; accept-new records the key as a side effect.
+  if ssh -i "$HOME/.ssh/deploy_key" \
+         -o StrictHostKeyChecking=accept-new \
+         -o ConnectTimeout=15 \
+         -o BatchMode=yes \
+         "${SSH_USER}@${ip}" true 2>/dev/null; then
+    echo "    ${ip} reachable"
+  else
+    echo "FAIL: cannot SSH to ${ip} as ${SSH_USER}." >&2
+    exit 1
+  fi
 done < <(terraform output -json node_public_ips | python3 -c \
   'import json,sys; [print(x) for x in json.load(sys.stdin)]')
 
@@ -74,7 +92,9 @@ ansible-playbook -i inventory.ini site.yml $CHECK_MODE \
 
 echo
 echo "==> Cluster health"
-ssh -i "$HOME/.ssh/deploy_key" "${SSH_USER}@${MASTER_IP}" \
+ssh -i "$HOME/.ssh/deploy_key" \
+  -o StrictHostKeyChecking=accept-new \
+  "${SSH_USER}@${MASTER_IP}" \
   "sudo /usr/local/bin/cluster-health.sh"
 
 cat <<SUMMARY
